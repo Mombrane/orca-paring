@@ -149,6 +149,6 @@ python3 gateway.py run --relay-host <PUBLIC_IP> --user <USER> --token <TOKEN>
 
 ## 管理员信息(部署/开通用户,非普通接入用户所需)
 
-服务器侧的 `relay.py`/`admin.py` 使用说明、systemd 部署、端口段规划等,不在本向导范围。
-需要搭建或开通用户时联系服务器管理员。开通命令(管理员在服务器执行):
+服务器侧的完整运维说明(部署、查/加/删用户、安全组、部署与回滚、排障)见
+**[`server/ADMIN.md`](server/ADMIN.md)**。开通用户命令(管理员在服务器执行):
 `cd /opt/orca-relay && python3 admin.py add <用户名>`。

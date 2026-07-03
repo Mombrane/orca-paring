@@ -100,7 +100,7 @@ async def main():
             "bob":   {"token": BOB_TOK,   "port": BOB_PUB},
         }, f)
 
-    relay = await run_proc("relay", os.path.join(HERE, "relay.py"),
+    relay = await run_proc("relay", os.path.join(HERE, "server", "relay.py"),
                            "--users", users_path, "--ctrl-port", str(CTRL_PORT))
     await asyncio.sleep(0.6)
     gw_a = await run_proc("gw-alice", os.path.join(HERE, "gateway.py"), "run",
