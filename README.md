@@ -1,167 +1,126 @@
-# orca-pairing — AI 执行手册
+# orca-pairing — 用户接入向导(给 AI 看)
 
-> 本文件是写给 **AI 编码助手(如 Claude Code)** 的部署与运维说明。
-> 如果你是被用户要求"照这个仓库把 Orca Mobile 内网穿透搭起来"的 AI,请从
-> 【任务目标】开始,按【执行流程】逐步执行,遇到【需要人工】标记处停下来让用户操作。
-
----
-
-## 任务目标
-
-让 [Orca](https://github.com/stablyai/orca) Mobile 在 **手机与电脑不在同一网络**
-(典型:电脑在公司内网,只能出方向、不能被外部连入)时,仍能连接桌面端 Orca。
-做法:借助一台**公网服务器**做纯 TCP 反向隧道透传。支持**多用户**,每人一个专属端口。
-
-## 背景知识(理解后再动手,不要跳过)
-
-1. **为什么能纯盲转**:Orca Mobile ↔ 桌面 Orca 之间是应用层端到端加密
-   (Curve25519 ECDH + XSalsa20-Poly1305),身份认证靠配对码里的 `deviceToken`,
-   **与连接的主机/端口无关**。所以公网服务器只需转发字节,无法也无需解密。
-   → 推论:中间**不要**做 TLS 终止 / HTTP 反代,只做 L4(TCP)透传。
-
-2. **桌面 Orca runtime**:默认监听 `127.0.0.1:6768`。经实测某些版本是**明文 ws://**
-   而非 wss://(应用层 E2EE 仍在)。盲转对两者都适用,无需关心。
-
-3. **为什么要改写配对码**:Orca Mobile 的"自定义网络地址"输入框**只接受裸 IPv4 或
-   `*.ts.net`,且端口锁死 6768**,无法填端口、无法填 `ws://`。多个用户都填同一公网 IP
-   就会全部撞到同一端口,无法区分。
-   → 解决:配对码本质是 `base64url(JSON{v,endpoint,deviceToken,publicKeyB64,scope})`。
-   用户在桌面 Orca 正常生成配对码后,用 `gateway.py pair` **只改写其中的 endpoint**
-   为 `ws://<公网IP>:<该用户专属端口>`,`deviceToken`/`publicKeyB64` 原样保留。
-   改写后的码给手机扫即可。
-
-## 架构
-
-```
- 手机 App ──:<用户端口>──► 公网服务器 ──[反向隧道]──► 用户电脑 ──► 127.0.0.1:6768 (Orca)
-           每用户一个端口     relay.py                 gateway.py run
-```
-
-- 内网封入方向、放出方向 → 本地 `gateway` **主动出方向**连服务器控制端口建反向隧道。
-- 手机连"用户专属公网端口" → relay 通过控制连接通知对应 gateway 回连一条数据隧道 → 盲转。
-
-## 组件
-
-| 文件 | 运行位置 | 作用 |
-| --- | --- | --- |
-| `relay.py` | 公网服务器 | 多租户中继:读 `users.json`,每用户开一个公网端口;共用控制端口 `7000` 建隧道;`SIGHUP` 热重载用户表 |
-| `gateway.py` | 每个用户的电脑 | `run` 子命令建隧道并盲转;`pair` 子命令改写配对码 endpoint |
-| `admin.py` | 公网服务器 | 用户管理 `add`/`list`/`show`/`remove`/`reload`;变更后自动 SIGHUP |
-
-握手协议(信令与数据分离,避免裸流错帧):
-- `CTRL <user> <token>\n` — 每用户一条常驻控制连接,只走行文本(`PING`/`PONG`/`NEW <id>`)
-- `DATA <user> <id> <token>\n` — 每个手机连接对应一条临时数据连接,头行之后纯盲转
+> 本文件写给 **AI 编码助手(如 Claude Code)**。
+> 场景:某公司已经部署好一台"Orca Mobile 内网穿透"服务器(见文末【管理员信息】),
+> 现在有一个**新用户**想让自己的手机连上自己电脑里的桌面 Orca。
+> 你的任务是**引导这个用户完成接入**——不需要、也不要去重新部署或修改服务器。
 
 ---
 
-## 执行流程(AI 按序执行)
+## 背景(先理解,再动手)
 
-### 前置:向用户收集这些输入 【需要人工】
+- 用户的电脑(通常在公司内网)只能出方向、不能被外部连入,所以手机在外网连不上它的桌面 Orca。
+- 已有一台公网服务器做**纯 TCP 反向隧道透传**:用户电脑主动连服务器建隧道,手机连服务器的
+  某个端口,流量经隧道回到用户电脑的 `127.0.0.1:6768`(桌面 Orca)。
+- 服务器只盲转字节,看不到明文(Orca Mobile↔桌面 Orca 之间是应用层端到端加密)。
+- 每个用户分配一个**专属端口**;靠改写配对码里的 endpoint 指向该端口来区分用户。
 
-- **公网服务器**:IP、SSH 登录方式(建议先装公钥免密)。服务器需有 `python3`(标准库即可)。
-- **用户列表**:每个要接入的用户起一个唯一标识(工号/拼音等,仅作隧道标签,非系统账号)。
-- 记 `PUBLIC_IP=<公网IP>`、控制端口 `CTRL_PORT=7000`、用户端口段默认 `7101-7150`。
+用户接入只需两个本地文件:`gateway.py`(在用户电脑跑)。`relay.py`/`admin.py` 是服务器侧的,
+用户**用不到**。
 
-### 步骤 1 — 部署 relay 到服务器
+## 前提:该用户已被管理员开通
 
-```bash
-ssh <server> 'mkdir -p /opt/orca-relay'
-scp relay.py admin.py <server>:/opt/orca-relay/
-ssh <server> 'test -f /opt/orca-relay/users.json || echo "{}" > /opt/orca-relay/users.json; chmod 600 /opt/orca-relay/users.json'
-```
+管理员会在服务器上 `admin.py add <用户名>`,得到并发给用户三样东西:
+- **用户名**(如 `zhangsan`) —— 只是隧道标签,不是 Orca/系统账号
+- **token**(一串随机字符)
+- **专属端口**(如 `7102`)
+- 以及**服务器公网 IP**
 
-配 systemd 常驻:
+如果用户还没有这三样,让他去找管理员开通(或按【管理员信息】联系)。**不要**尝试自己去服务器开通,
+除非用户明确拥有服务器管理权限。
 
-```bash
-ssh <server> 'cat >/etc/systemd/system/orca-relay.service <<EOF
-[Unit]
-Description=Orca Mobile reverse-tunnel relay (multi-tenant)
-After=network.target
-[Service]
-ExecStart=/usr/bin/python3 /opt/orca-relay/relay.py --users /opt/orca-relay/users.json --ctrl-port 7000
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload && systemctl enable --now orca-relay && systemctl is-active orca-relay'
-```
+---
 
-### 步骤 2 — 放行端口 【需要人工】
+## 接入流程(引导用户按序做)
 
-在云厂商**安全组/防火墙**放行入方向 TCP:控制端口 `7000` + 用户端口段 `7101-7150`。
-(注意:很多云主机真正的入站管控在控制台安全组,不是机器上的 iptables/ufw。)
-验证:`nc -z -v -w5 <PUBLIC_IP> 7000` —— `succeeded` 或 `Connection refused` 都说明包能到
-(refused = 端口没监听但已放行);`timed out` = **安全组没放行**,需人工处理。
+设占位符:`PUBLIC_IP`=服务器公网IP,`USER`=用户名,`TOKEN`=token,`PORT`=专属端口。
 
-### 步骤 3 — 开通用户(服务器上,每个用户一次)
+### 步骤 1 — 确认桌面 Orca 正在运行且启用了 Mobile
+
+桌面 Orca 需开着,且 Settings → Mobile 可用(runtime 监听 `127.0.0.1:6768`)。
+可验证:`lsof -nP -iTCP:6768 -sTCP:LISTEN`(macOS)应看到 Orca 在监听。
+
+### 步骤 2 — 运行本地网关(gateway)
+
+在用户电脑执行(需 `python3`,仅标准库):
 
 ```bash
-ssh <server> 'cd /opt/orca-relay && ORCA_RELAY_PUBLIC=<PUBLIC_IP> python3 admin.py add <用户名>'
+python3 gateway.py run --relay-host <PUBLIC_IP> --user <USER> --token <TOKEN>
 ```
 
-输出会给出该用户的**端口 + token + 给用户的操作说明**,原样转发给用户。
+成功日志:`[<USER>] 已连上 relay 控制端口 <PUBLIC_IP>:7000`。
+> 这会占用一个前台进程。让它一直开着;需要长期可用应做成开机自启(见【可选:开机自启】)。
 
-### 步骤 4 — 用户电脑:运行 gateway 【在每个用户自己的机器上】
+### 步骤 3 — 生成并改写配对码
 
-```bash
-python3 gateway.py run --relay-host <PUBLIC_IP> --user <用户名> --token <token>
-```
-
-建议做成开机自启(macOS launchd / Linux systemd --user),否则关终端即断。
-
-### 步骤 5 — 用户配对手机
-
-1. 桌面 Orca → Settings → Mobile → 生成手机配对码 → **复制**(得到 `orca://pair?code=...`)。
-2. 改写 endpoint 为专属端口:
+1. 桌面 Orca → Settings → Mobile → 生成手机配对码 → 点**复制配对链接**
+   (得到形如 `orca://pair?code=...` 的字符串)。
+2. 改写其 endpoint 为该用户专属端口:
    ```bash
-   python3 gateway.py pair --relay-host <PUBLIC_IP> --port <该用户端口>
+   python3 gateway.py pair --relay-host <PUBLIC_IP> --port <PORT>
    ```
-   (省略 `--code` 时自动读 macOS 剪贴板;也可 `--code '<配对码>'` 显式传入。)
-3. 把输出的新 `orca://pair?code=...` 交给手机:Orca Mobile 扫码或粘贴。
+   - 省略 `--code` 时自动读 macOS 剪贴板(即刚复制的那个);
+   - 或显式传:`--code 'orca://pair?code=...'`。
+3. 命令会打印一个**新的** `orca://pair?code=...`(endpoint 已改为 `ws://<PUBLIC_IP>:<PORT>`)。
 
-### 步骤 6 — 验证
+### 步骤 4 — 手机配对
 
-- 命令行探活(应返回 `HTTP/1.1 101 Switching Protocols`):
+把步骤 3 输出的新配对码交给手机上的 **Orca Mobile**:扫码,或用其"粘贴配对码"入口粘进去。
+若需要二维码,可用任意二维码工具把那串文本转成二维码给手机扫。
+
+### 步骤 5 — 验证连上了
+
+- 让用户在手机 Orca Mobile 上看是否出现其电脑的会话/终端。
+- 或命令行探活(应返回 `HTTP/1.1 101 Switching Protocols`):
   ```bash
-  printf 'GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n' | nc <PUBLIC_IP> <用户端口>
+  printf 'GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n' | nc <PUBLIC_IP> <PORT>
   ```
-- 服务器看实时日志:`ssh <server> 'journalctl -u orca-relay -f'`,手机连上会打印
-  `[<用户>] 手机连接 ... 隧道建立,开始盲转`。
 
 ---
-
-## 运维速查
-
-| 操作 | 命令(服务器 `/opt/orca-relay`) |
-| --- | --- |
-| 列出用户 | `python3 admin.py list` |
-| 看某用户 token | `python3 admin.py show <用户名>` |
-| 删除用户 | `python3 admin.py remove <用户名>` |
-| 改了 users.json 后重载 | `python3 admin.py reload` |
-| 看 relay 日志 | `journalctl -u orca-relay -f` |
 
 ## 故障排查
 
-- **手机连不上、`nc` 测端口 timed out** → 安全组未放行该端口(步骤 2)。
-- **gateway 日志停在"连不上 relay"** → 服务器 relay 未运行,或控制端口 7000 未放行,
-  或本地出方向被防火墙拦。
-- **relay 日志有"手机连接…等待 gateway 回连超时"** → 该用户的 gateway 没在运行
-  (让用户执行步骤 4),或 gateway 连本地 6768 失败(桌面 Orca 未开 / 未启用 Mobile)。
-- **relay 日志"CTRL 鉴权失败"** → gateway 的 `--user`/`--token` 与 `users.json` 不一致。
-- **手机连上又秒断属正常**:Orca Mobile 会开多条连接(RPC/终端/截屏),开合频繁不代表故障。
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| gateway 日志停在"连不上 relay" | `PUBLIC_IP`/端口错;或本地出方向被拦。确认能出方向访问服务器 7000。 |
+| 手机连不上、`nc` 测端口 timed out | 该用户端口未在服务器安全组放行 → 联系管理员。 |
+| 手机扫码后"等待…"然后失败 | gateway 没在运行(回步骤 2);或桌面 Orca 没开(步骤 1)。 |
+| 提示鉴权失败 | `--user`/`--token` 与管理员给的不一致。 |
+| 连上又秒断 | 正常。Orca Mobile 会开多条连接(RPC/终端/截屏),开合频繁不代表故障。 |
+| `pair` 报"配对码解析失败" | 复制的不是 Orca 的手机配对链接;重新在 Settings→Mobile 复制。 |
 
-## 安全须知(AI 必须遵守)
+## 可选:开机自启(让 gateway 常驻,macOS launchd)
 
-- **切勿**把 `users.json`、`.token`、任何真实 token / 公网 IP 提交进公开仓库
-  (`.gitignore` 已忽略 `users.json`、`.token`、`.qrvenv/`)。
-- 每用户 token 为随机 32 字节,只能认领自己端口的隧道。
-- 服务器仅做字节转发,不解密、不接触 `deviceToken` 之外的凭证。
-- 若用户把密码/密钥贴进对话,提醒其事后轮换。
+创建 `~/Library/LaunchAgents/dev.orca.gateway.plist`(把占位符换成实际值、路径填 gateway.py 绝对路径):
 
-## 自测(修改代码后运行)
-
-```bash
-python3 selftest.py        # 单租户闭环:握手/配对/大小数据/并发
-python3 selftest_multi.py  # 多租户:隔离(A手机只到A的Orca)+ 并发 + pair 改写
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.orca.gateway</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/绝对路径/gateway.py</string>
+    <string>run</string>
+    <string>--relay-host</string><string>PUBLIC_IP</string>
+    <string>--user</string><string>USER</string>
+    <string>--token</string><string>TOKEN</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
 ```
+
+加载:`launchctl load ~/Library/LaunchAgents/dev.orca.gateway.plist`。
+
+## 安全须知
+
+- token 是用户凭证,勿提交进任何公开仓库、勿在公开场合粘贴。
+- 服务器只做字节转发,不解密。
+- 每个用户 token 只能认领自己端口的隧道,无法冒充他人。
+
+## 管理员信息(部署/开通用户,非普通接入用户所需)
+
+服务器侧的 `relay.py`/`admin.py` 使用说明、systemd 部署、端口段规划等,不在本向导范围。
+需要搭建或开通用户时联系服务器管理员。开通命令(管理员在服务器执行):
+`cd /opt/orca-relay && python3 admin.py add <用户名>`。
