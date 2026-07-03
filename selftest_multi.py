@@ -67,6 +67,19 @@ async def phone_send(port: int, payload: bytes, timeout=5) -> bytes:
     return got
 
 
+async def ctrl_handshake(port: int, line: str, timeout=3) -> bytes:
+    """向控制端口发一行握手,返回 relay 的首行响应(用于验鉴权失败/重复账号的 ERR 反馈)。"""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(line.encode())
+    await writer.drain()
+    try:
+        resp = await asyncio.wait_for(reader.readline(), timeout)
+    except asyncio.TimeoutError:
+        resp = b""
+    writer.close()
+    return resp
+
+
 async def main():
     results = []
     def check(label, cond):
@@ -128,12 +141,76 @@ async def main():
     except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
         check("未注册端口 15999 不可连", True)
 
-    for p in (relay, gw_a, gw_b):
+    # 5) 鉴权失败:错误 token 应收到明确的 ERR unauthorized(而非静默关闭)
+    resp = await ctrl_handshake(CTRL_PORT, "CTRL alice WRONG_TOKEN\n")
+    check("错token→ERR unauthorized", resp.strip() == b"ERR unauthorized")
+
+    # 6) 未知用户名同样 unauthorized
+    resp = await ctrl_handshake(CTRL_PORT, "CTRL nobody sometoken\n")
+    check("未知用户→ERR unauthorized", resp.strip() == b"ERR unauthorized")
+
+    # 7) 重复账号:alice 已由 gw_a 在线,再用正确 token 连应被拒 already_connected
+    resp = await ctrl_handshake(CTRL_PORT, f"CTRL alice {ALICE_TOK}\n")
+    check("重复账号→ERR already_connected", resp.strip() == b"ERR already_connected")
+
+    # 8) 拒绝重复后,alice 原连接仍可用(隔离/在线未被破坏)
+    got = await phone_send(ALICE_PUB, b"still-alive")
+    check("重复被拒后 alice 仍在线", got == b"A:still-alive")
+
+    # 9) 格式错误的 CTRL(字段数不对)→ ERR bad_request
+    resp = await ctrl_handshake(CTRL_PORT, "CTRL onlyone\n")
+    check("格式错→ERR bad_request", resp.strip() == b"ERR bad_request")
+
+    # 9b) 向后兼容:模拟"老版 gateway"(只认 PING/NEW,遇到未知行会忽略而非崩溃)。
+    #     用 bob 的 token 连(bob 的 gw_b 先停掉,腾出在线位),验证:
+    #       - 能建立控制连接并正常收发 PING/PONG(老协议不变)
+    #       - 手机连 bob 端口能正常盲转(证明老客户端行为仍工作)
+    gw_b.terminate()
+    await asyncio.sleep(1.5)  # 等 relay 判定 bob 旧连接断开(gw_b 停 → TCP 关闭)
+
+    async def legacy_gateway_once():
+        r, w = await asyncio.open_connection("127.0.0.1", CTRL_PORT)
+        w.write(f"CTRL bob {BOB_TOK}\n".encode())
+        await w.drain()
+        # 老 gateway 的循环:只处理 PING/NEW,其它行(如未来的 ERR)直接忽略不崩
+        while True:
+            line = await asyncio.wait_for(r.readline(), 10)
+            if not line:
+                return
+            c = line.strip().split(b" ")
+            if c[0] == b"PING":
+                w.write(b"PONG\n"); await w.drain()
+            elif c[0] == b"NEW" and len(c) == 2:
+                cid = c[1].decode()
+                # 回连数据隧道 → bob 的假 Orca
+                dr, dw = await asyncio.open_connection("127.0.0.1", CTRL_PORT)
+                dw.write(f"DATA bob {cid} {BOB_TOK}\n".encode()); await dw.drain()
+                lr, lw = await asyncio.open_connection("127.0.0.1", BOB_ORCA)
+                async def cp(a, b):
+                    try:
+                        while True:
+                            d = await a.read(65536)
+                            if not d: break
+                            b.write(d); await b.drain()
+                    except Exception: pass
+                    finally:
+                        try: b.close()
+                        except Exception: pass
+                asyncio.create_task(asyncio.gather(cp(dr, lw), cp(lr, dw)))
+            # 其它(未知/ERR)→ 忽略,继续循环(这就是老 gateway 的宽容行为)
+
+    legacy_task = asyncio.create_task(legacy_gateway_once())
+    await asyncio.sleep(0.8)  # 等老客户端建好控制连接
+    got = await phone_send(BOB_PUB, b"legacy-ok")
+    check("老版gateway兼容:bob端口盲转正常", got == b"B:legacy-ok")
+    legacy_task.cancel()
+
+    for p in (relay, gw_a):
         p.terminate()
     a_orca.close(); b_orca.close()
     await asyncio.sleep(0.2)
 
-    # 5) pair 子命令改写 endpoint(纯函数级验证)
+    # 10) pair 子命令改写 endpoint(纯函数级验证)
     sys.path.insert(0, HERE)
     import gateway as gwmod
     offer = {"v": 2, "endpoint": "ws://127.0.0.1:6768",

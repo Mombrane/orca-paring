@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sys
 import time
 
@@ -32,9 +33,39 @@ DATA_PAIR_TIMEOUT = 30
 HEADER_TIMEOUT = 10
 BUF = 65536
 
+# 每用户同时存在的手机数据连接上限。正常用约 10 条,64 足够宽松,
+# 又能挡住"单端口连接洪水"打满 fd 的异常/攻击。
+MAX_CONNS_PER_USER = 64
+# 同一来源 IP 在窗口内鉴权失败的次数上限,超过则临时拒绝(防扫描/刷屏)。
+AUTH_FAIL_MAX = 8
+AUTH_FAIL_WINDOW = 60      # 秒
+AUTH_FAIL_BLOCK = 120      # 触发后拉黑时长(秒)
+# TCP keepalive:空闲多久开始探测,探测间隔,失败几次判死。
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTVL = 15
+KEEPALIVE_CNT = 4
+
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+def enable_keepalive(writer: asyncio.StreamWriter):
+    """给底层 socket 打开 TCP keepalive,让死连接被内核回收,避免 fd 泄漏。"""
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # 这些选项 Linux 有;其它平台缺失就忽略(getattr 兜底)。
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTVL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_CNT)
+    except OSError:
+        pass
 
 
 class User:
@@ -48,6 +79,7 @@ class User:
         self.pending: dict[str, asyncio.Future] = {}
         self._next_id = 0
         self.server: asyncio.base_events.Server | None = None  # 该用户的公网监听
+        self.active_conns = 0  # 当前正在盲转的手机数据连接数
 
     def new_id(self) -> str:
         self._next_id += 1
@@ -61,6 +93,25 @@ class Relay:
         self.host = host
         self.users: dict[str, User] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
+        # 来源 IP -> (窗口内失败次数, 窗口起始时间, 拉黑到期时间)
+        self._auth_fails: dict[str, list] = {}
+
+    # ---- 失败连接速率限制(防扫描/刷屏)----
+    def _ip_blocked(self, ip: str, now: float) -> bool:
+        rec = self._auth_fails.get(ip)
+        if not rec:
+            return False
+        return now < rec[2]  # 仍在拉黑期内
+
+    def _record_auth_fail(self, ip: str, now: float):
+        rec = self._auth_fails.get(ip)
+        if not rec or now - rec[1] > AUTH_FAIL_WINDOW:
+            rec = [0, now, 0.0]  # [count, window_start, blocked_until]
+        rec[0] += 1
+        if rec[0] >= AUTH_FAIL_MAX:
+            rec[2] = now + AUTH_FAIL_BLOCK
+            log(f"来源 {ip} 鉴权失败过多,拉黑 {AUTH_FAIL_BLOCK}s")
+        self._auth_fails[ip] = rec
 
     # ---- 用户表加载 / 热重载 ----
     def load_users_file(self) -> dict:
@@ -110,6 +161,13 @@ class Relay:
     # ---- 握手分流(控制端口上) ----
     async def handle_ctrl_port(self, reader, writer):
         peer = writer.get_extra_info("peername")
+        ip = peer[0] if peer else "?"
+        now = time.time()
+        # 被拉黑的 IP 直接断开,不浪费资源
+        if self._ip_blocked(ip, now):
+            writer.close()
+            return
+        enable_keepalive(writer)
         try:
             line = await asyncio.wait_for(reader.readline(), HEADER_TIMEOUT)
         except asyncio.TimeoutError:
@@ -119,11 +177,23 @@ class Relay:
             writer.close(); return
         tag = parts[0]
         if tag == CTRL_TAG:
-            await self.handle_ctrl(parts, reader, writer, peer)
+            await self.handle_ctrl(parts, reader, writer, peer, ip)
         elif tag == DATA_TAG:
             await self.handle_data(parts, reader, writer)
         else:
             writer.close()
+
+    async def _send_err_and_close(self, writer, code: str):
+        """向 gateway 发送一行明确的错误码再关闭。老版 gateway 会忽略此行,兼容。"""
+        try:
+            writer.write(f"ERR {code}\n".encode())
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        try:
+            writer.close()
+        except Exception:
+            pass
 
     def _lookup(self, name_b: bytes, token_b: bytes) -> User | None:
         name = name_b.decode(errors="replace")
@@ -133,17 +203,22 @@ class Relay:
         return u
 
     # ---- 控制连接:CTRL <user> <token> ----
-    async def handle_ctrl(self, parts, reader, writer, peer):
+    async def handle_ctrl(self, parts, reader, writer, peer, ip):
         if len(parts) != 3:
-            writer.close(); return
+            await self._send_err_and_close(writer, "bad_request")
+            return
         u = self._lookup(parts[1], parts[2])
         if u is None:
+            self._record_auth_fail(ip, time.time())
             log("CTRL 鉴权失败", peer, parts[1] if len(parts) > 1 else b"")
-            writer.close(); return
-        if u.ctrl_writer is not None:
-            log(f"用户 {u.name} 已有 CTRL,替换旧连接")
-            try: u.ctrl_writer.close()
-            except Exception: pass
+            await self._send_err_and_close(writer, "unauthorized")
+            return
+        # 3a) 重复账号:已有在线控制连接则拒绝后来者(防止两人共用一个 token
+        #     互相踢占、导致流量串到对方电脑)。后来者收到明确错误码。
+        if u.ctrl_writer is not None and u.ctrl_alive:
+            log(f"用户 {u.name} 已在线,拒绝重复连接", peer)
+            await self._send_err_and_close(writer, "already_connected")
+            return
         u.ctrl_writer = writer
         u.ctrl_alive = True
         log(f"用户 {u.name} gateway 已连接(CTRL)", peer)
@@ -180,6 +255,7 @@ class Relay:
         u = self._lookup(parts[1], parts[3])
         if u is None:
             writer.close(); return
+        enable_keepalive(writer)
         cid = parts[2].decode(errors="replace")
         fut = u.pending.get(cid)
         if fut is None or fut.done():
@@ -197,6 +273,11 @@ class Relay:
         if not u.ctrl_alive or u.ctrl_writer is None:
             log(f"[{u.name}] 手机来连但 gateway 不在线,拒绝", peer)
             writer.close(); return
+        # 5) 每用户并发连接上限:挡住"单端口连接洪水"打满 fd。
+        if u.active_conns >= MAX_CONNS_PER_USER:
+            log(f"[{u.name}] 并发连接达上限 {MAX_CONNS_PER_USER},拒绝新连接", peer)
+            writer.close(); return
+        enable_keepalive(writer)
         cid = u.new_id()
         fut = self.loop.create_future()
         u.pending[cid] = fut
@@ -213,8 +294,12 @@ class Relay:
             u.pending.pop(cid, None); writer.close(); return
         finally:
             u.pending.pop(cid, None)
-        log(f"[{u.name}] {cid} 隧道建立,开始盲转")
-        await pipe_bidirectional(reader, writer, g_reader, g_writer)
+        u.active_conns += 1
+        log(f"[{u.name}] {cid} 隧道建立,开始盲转(活跃 {u.active_conns})")
+        try:
+            await pipe_bidirectional(reader, writer, g_reader, g_writer)
+        finally:
+            u.active_conns -= 1
         log(f"[{u.name}] {cid} 关闭")
 
 

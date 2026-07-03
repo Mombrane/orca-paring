@@ -17,6 +17,7 @@ import argparse
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -25,9 +26,34 @@ RECONNECT_DELAYS = [1, 2, 4, 8, 15, 30]
 CTRL_READ_TIMEOUT = 45
 BUF = 65536
 
+# TCP keepalive 参数(与 relay 侧一致),让死连接被内核回收。
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTVL = 15
+KEEPALIVE_CNT = 4
+
+
+class FatalAuthError(Exception):
+    """明确的鉴权失败(token/用户名错),不应无限重连。"""
+
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+def enable_keepalive(writer):
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTVL)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_CNT)
+    except OSError:
+        pass
 
 
 # ===================== 子命令 run =====================
@@ -46,6 +72,14 @@ class Gateway:
             try:
                 await self.connect_ctrl()
                 attempt = 0
+            except FatalAuthError as e:
+                # token/用户名错:重连也没用,明确告知用户并退出。
+                log("=" * 56)
+                log(f"❌ 鉴权失败:{e}")
+                log("   请核对 --user 和 --token 是否与管理员下发的一致。")
+                log("   (这不是网络问题,重连无用,已停止。)")
+                log("=" * 56)
+                return
             except (ConnectionError, OSError, asyncio.TimeoutError) as e:
                 log("控制连接失败:", e)
             delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
@@ -55,6 +89,7 @@ class Gateway:
 
     async def connect_ctrl(self):
         reader, writer = await asyncio.open_connection(self.relay_host, self.ctrl_port)
+        enable_keepalive(writer)
         writer.write(f"CTRL {self.user} {self.token}\n".encode())
         await writer.drain()
         log(f"[{self.user}] 已连上 relay 控制端口 {self.relay_host}:{self.ctrl_port}")
@@ -71,6 +106,19 @@ class Gateway:
                 elif cmd[0] == b"NEW" and len(cmd) == 2:
                     cid = cmd[1].decode(errors="replace")
                     asyncio.create_task(self.open_data(cid))
+                elif cmd[0] == b"ERR" and len(cmd) >= 2:
+                    code = cmd[1].decode(errors="replace")
+                    if code in ("unauthorized", "bad_request"):
+                        raise FatalAuthError(f"服务器拒绝({code})")
+                    elif code == "already_connected":
+                        # 该账号已有一个 gateway 在线。可能是重复使用同一 token,
+                        # 也可能是自己上一条连接尚未被服务器判死。继续重连等待其超时。
+                        log("⚠️ 该账号已有 gateway 在线(already_connected)。"
+                            "若你确未多开,稍候会自动重连;若持续如此,请确认没有第二个人在用同一 token。")
+                        break
+                    else:
+                        log("收到未知错误码:", code)
+                        break
                 else:
                     log("未知控制指令:", line.strip())
         finally:
@@ -85,6 +133,7 @@ class Gateway:
             return
         try:
             r_reader, r_writer = await asyncio.open_connection(self.relay_host, self.ctrl_port)
+            enable_keepalive(r_writer)
             r_writer.write(f"DATA {self.user} {cid} {self.token}\n".encode())
             await r_writer.drain()
         except OSError as e:
